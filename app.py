@@ -1,10 +1,10 @@
-"""
-app.py - Student Studies Virtual Academic Analyst (MCP) - Streamlit UI
-Run locally:   streamlit run app.py
-Self-contained: database bootstrap, MCP tools, guardrails and agent are all in this file.
-Deploy with just:  app.py + requirements.txt
-"""
+%%writefile app.py
+# app.py - Student Studies Virtual Academic Analyst (MCP) - Streamlit UI
+# Run locally:   streamlit run app.py
+# Self-contained: database bootstrap, MCP tools, guardrails and agent are all in this file.
+# Deploy with just:  app.py + requirements.txt
 import os
+import time
 
 import streamlit as st
 
@@ -42,22 +42,20 @@ if not os.environ.get("GOOGLE_API_KEY"):
 # ##############################################################################
 # PART A - DATABASE (student_db)
 # ##############################################################################
-"""
-student_db.py
--------------
-Creates and manages the sample Student Studies database (SQLite).
-
-Tables (baseline):
-  programmes   - academic programmes offered by the faculty
-  students     - enrolled students (with computed CGPA)
-  courses      - courses / subjects for each programme
-  enrollments  - each student's scores and grades per course
-  attendance   - class attendance per student per course
-
-Extra tables added by the "live migration" demo:
-  assignments  - coursework assignments and due dates
-  scholarships - scholarship awards per student
-"""
+# student_db.py
+# -------------
+# Creates and manages the sample Student Studies database (SQLite).
+#
+# Tables (baseline):
+#   programmes   - academic programmes offered by the faculty
+#   students     - enrolled students (with computed CGPA)
+#   courses      - courses / subjects for each programme
+#   enrollments  - each student's scores and grades per course
+#   attendance   - class attendance per student per course
+#
+# Extra tables added by the "live migration" demo:
+#   assignments  - coursework assignments and due dates
+#   scholarships - scholarship awards per student
 import os
 import random
 import sqlite3
@@ -317,19 +315,17 @@ def export_schema(db_file: str = DB_FILE, schema_file: str = SCHEMA_FILE) -> Non
 # ##############################################################################
 # PART B - MCP TOOLS, GUARDRAILS & AGENT (student_mcp_tools)
 # ##############################################################################
-"""
-student_mcp_tools.py
---------------------
-MCP-style database toolset + security guardrails + agent factory
-for the Student Studies Virtual Academic Analyst.
-
-MCP tools exposed to the agent (read-only, least privilege):
-  mcp_list_tables()              -> discover tables at runtime
-  mcp_describe_table(table_name) -> inspect columns + foreign keys
-  mcp_read_query(sql_query)      -> run a read-only SELECT
-
-No write / mutation tool is ever registered with the model.
-"""
+# student_mcp_tools.py
+# --------------------
+# MCP-style database toolset + security guardrails + agent factory
+# for the Student Studies Virtual Academic Analyst.
+#
+# MCP tools exposed to the agent (read-only, least privilege):
+#   mcp_list_tables()              -> discover tables at runtime
+#   mcp_describe_table(table_name) -> inspect columns + foreign keys
+#   mcp_read_query(sql_query)      -> run a read-only SELECT
+#
+# No write / mutation tool is ever registered with the model.
 import asyncio
 import json
 import re
@@ -521,9 +517,11 @@ AGENT_INSTRUCTION = """You are the Virtual Academic Analyst for a Malaysian univ
 academic advisors and programme leaders understand student study performance.
 You work through the Model Context Protocol (MCP) and do NOT have a hard-coded schema.
 
-HOW TO WORK
-1. Call 'mcp_list_tables' to discover which tables exist (they can change at any time).
-2. Call 'mcp_describe_table' for every table you plan to use, to confirm exact column names.
+HOW TO WORK (be fast: use as few tool calls as possible)
+0. Greetings, thanks, small talk or 'who are you' -> reply briefly and DO NOT call any tool.
+1. For a data question, call 'mcp_list_tables' if you have not done so yet in this conversation,
+   or if the user mentions data you have not seen (tables can be added at any time).
+2. Call 'mcp_describe_table' only for tables you need and have not described yet in this conversation.
 3. Call 'mcp_read_query' with ONE read-only SELECT to get the facts. Use JOINs where needed.
 4. Never guess numbers - every figure in your answer must come from a query result.
 
@@ -591,8 +589,12 @@ class StudentAnalystChat:
             _run_coro_sync(result)
         self.runner = Runner(agent=agent, app_name=app_name, session_service=self.session_service)
 
-    def ask(self, prompt: str, mask: bool = True):
-        """Send one question. Returns (answer_text, tool_calls)."""
+    def ask(self, prompt: str, mask: bool = True, on_tool_call=None):
+        """Send one question. Returns (answer_text, tool_calls).
+
+        on_tool_call: optional callback(call_dict) fired live as each MCP tool is called,
+                      so a UI can show progress instead of a silent spinner.
+        """
         from google.genai import types
 
         message = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
@@ -603,8 +605,11 @@ class StudentAnalystChat:
                     continue
                 for part in event.content.parts:
                     if getattr(part, "function_call", None):
-                        tool_calls.append({"tool": part.function_call.name,
-                                           "args": dict(part.function_call.args or {})})
+                        call = {"tool": part.function_call.name,
+                                "args": dict(part.function_call.args or {})}
+                        tool_calls.append(call)
+                        if on_tool_call:
+                            on_tool_call(json.loads(anonymize_student_data(json.dumps(call))) if mask else call)
                     elif getattr(part, "text", None) and not getattr(part, "thought", False):
                         answer_parts.append(part.text)
             answer = "".join(answer_parts).strip() or "No response generated."
@@ -734,8 +739,20 @@ if prompt:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Discovering tables and querying via MCP tools..."):
-            answer, calls = st.session_state.chat.ask(prompt, mask=mask_on)
+        started = time.time()
+        # Live progress: each MCP tool call appears as soon as the agent makes it
+        with st.status("🤔 Thinking...", expanded=True) as status:
+            def show_progress(call):
+                label = {"mcp_list_tables": "📋 Discovering tables",
+                         "mcp_describe_table": "🔍 Inspecting table",
+                         "mcp_read_query": "⚙️ Running SQL query"}.get(call["tool"], call["tool"])
+                detail = call["args"].get("table_name", "")
+                status.write(f"{label} {('`' + detail + '`') if detail else ''}")
+                status.update(label=f"{label}...")
+
+            answer, calls = st.session_state.chat.ask(prompt, mask=mask_on, on_tool_call=show_progress)
+            status.update(label=f"✅ Done in {time.time() - started:.1f}s · {len(calls)} tool call(s)",
+                          state="complete", expanded=False)
         st.markdown(answer)
         render_tool_calls(calls)
     st.session_state.messages.append({"role": "assistant", "content": answer, "tool_calls": calls})
